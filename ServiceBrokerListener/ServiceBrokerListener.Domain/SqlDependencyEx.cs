@@ -134,8 +134,10 @@ namespace ServiceBrokerListener.Domain
                             -- Notification Trigger configuration statement.
                             DECLARE @triggerStatement NVARCHAR(MAX)
                             DECLARE @select NVARCHAR(MAX)
+                            DECLARE @selectUpdate NVARCHAR(MAX)
                             DECLARE @sqlInserted NVARCHAR(MAX)
                             DECLARE @sqlDeleted NVARCHAR(MAX)
+                            DECLARE @sqlUpdated NVARCHAR(MAX)
                             
                             SET @triggerStatement = N''{3}''
                             
@@ -151,11 +153,19 @@ namespace ServiceBrokerListener.Domain
                             SET @sqlDeleted = 
                                 N''SET @retvalOUT = (SELECT '' + @select + N'' 
                                                      FROM DELETED 
-                                                     FOR XML PATH(''''row''''), ROOT (''''deleted''''))''                            
+                                                     FOR XML PATH(''''row''''), ROOT (''''deleted''''))''  
+                            SET @selectUpdate = STUFF((SELECT '' OR '' + ''UPDATE(['' + COLUMN_NAME + ''])''
+						                         FROM INFORMATION_SCHEMA.COLUMNS
+						                         WHERE DATA_TYPE NOT IN  (''text'',''ntext'',''image'') AND TABLE_NAME = ''{5}'' AND TABLE_CATALOG = ''{0}'' AND TABLE_SCHEMA = ''{6}'' {7}
+						                         FOR XML PATH ('''')
+						                         ), 1, 4, '''')            
+                           SET @sqlUpdated = N'''' + @selectUpdate + N''''
                             SET @triggerStatement = REPLACE(@triggerStatement
                                                      , ''%inserted_select_statement%'', @sqlInserted)
                             SET @triggerStatement = REPLACE(@triggerStatement
                                                      , ''%deleted_select_statement%'', @sqlDeleted)
+                            SET @triggerStatement = REPLACE(@triggerStatement
+                                                     , ''%updated_select_statement%'', @sqlUpdated)
 
                             EXEC sp_executeSql @triggerStatement
                         END
@@ -349,6 +359,78 @@ namespace ServiceBrokerListener.Domain
                 END
             ";
 
+        /// <summary>
+        /// T-SQL script-template which creates notification trigger.
+        /// {0} - monitorable table name.
+        /// {1} - notification trigger name.
+        /// {2} - event data (INSERT, DELETE, UPDATE...).
+        /// {3} - conversation service name. 
+        /// {4} - detailed changes tracking mode.
+        /// {5} - schema name.
+        /// %inserted_select_statement% - sql code which sets trigger "inserted" value to @retvalOUT variable.
+        /// %deleted_select_statement% - sql code which sets trigger "deleted" value to @retvalOUT variable.
+        /// </summary>
+        private const string SQL_FORMAT_CREATE_NOTIFICATION_TRIGGER_WITH_FIELDS = @"
+                CREATE TRIGGER [{1}]
+                ON {5}.[{0}]
+                AFTER {2} 
+                AS
+
+                SET NOCOUNT ON;
+
+                --Determine if this is an INSERT,UPDATE, or DELETE Action or a failed delete.
+                DECLARE @Action as char(1);
+				SET @Action = (CASE WHEN EXISTS(SELECT* FROM INSERTED)
+                                        AND EXISTS(SELECT* FROM DELETED)
+                                    THEN 'U'  -- Set Action to Updated.
+                                    WHEN EXISTS(SELECT* FROM INSERTED)
+                                    THEN 'I'  -- Set Action to Insert.
+                                    WHEN EXISTS(SELECT* FROM DELETED)
+                                    THEN 'D'  -- Set Action to Deleted.
+                                    ELSE NULL -- Skip.It may have been a failed delete.   
+                                END)
+
+                IF @Action = 'I' OR @Action = 'D' OR (@Action = 'U' AND (%updated_select_statement%))
+				BEGIN
+                    --Trigger {0} is rising...
+                    IF EXISTS (SELECT * FROM sys.services WHERE name = '{3}')
+                    BEGIN
+                        DECLARE @message NVARCHAR(MAX)
+                        SET @message = N'<root/>'
+
+                        IF ({4} EXISTS(SELECT 1))
+                        BEGIN
+                            DECLARE @retvalOUT NVARCHAR(MAX)
+
+                            %inserted_select_statement%
+
+                            IF (@retvalOUT IS NOT NULL)
+                            BEGIN SET @message = N'<root>' + @retvalOUT END                        
+
+                            %deleted_select_statement%
+
+                            IF (@retvalOUT IS NOT NULL)
+                            BEGIN
+                                IF (@message = N'<root/>') BEGIN SET @message = N'<root>' + @retvalOUT END
+                                ELSE BEGIN SET @message = @message + @retvalOUT END
+                            END 
+
+                            IF (@message != N'<root/>') BEGIN SET @message = @message + N'</root>' END
+                        END
+
+                	    --Beginning of dialog...
+                	    DECLARE @ConvHandle UNIQUEIDENTIFIER
+                	    --Determine the Initiator Service, Target Service and the Contract 
+                	    BEGIN DIALOG @ConvHandle 
+                            FROM SERVICE [{3}] TO SERVICE '{3}' ON CONTRACT [DEFAULT] WITH ENCRYPTION=OFF, LIFETIME = 60; 
+	                    --Send the Message
+	                    SEND ON CONVERSATION @ConvHandle MESSAGE TYPE [DEFAULT] (@message);
+	                    --End conversation
+	                    END CONVERSATION @ConvHandle;
+                    END
+                END
+            ";
+
         #endregion
 
         #region Miscellaneous
@@ -512,6 +594,8 @@ namespace ServiceBrokerListener.Domain
 
         public string SchemaName { get; private set; }
 
+        public List<string> FieldList { get; set; }
+
         public NotificationTypes NotificaionTypes { get; private set; }
 
         public bool DetailsIncluded { get; private set; }
@@ -535,7 +619,9 @@ namespace ServiceBrokerListener.Domain
             string schemaName = "dbo",
             NotificationTypes listenerType =
                 NotificationTypes.Insert | NotificationTypes.Update | NotificationTypes.Delete,
-            bool receiveDetails = true, int identity = 1)
+            bool receiveDetails = true, 
+            int identity = 1,
+            List<string> fieldList = null)
         {
             this.ConnectionString = connectionString;
             this.DatabaseName = databaseName;
@@ -544,6 +630,13 @@ namespace ServiceBrokerListener.Domain
             this.NotificaionTypes = listenerType;
             this.DetailsIncluded = receiveDetails;
             this.Identity = identity;
+            if (fieldList != null)
+            {
+                this.FieldList = new List<string>();
+                foreach(var field in fieldList) {
+                    this.FieldList.Add(string.Format("''{0}''", field));
+                }
+            }
         }
 
         public void Start()
@@ -718,9 +811,19 @@ namespace ServiceBrokerListener.Domain
                 this.ConversationQueueName,
                 this.ConversationServiceName,
                 this.SchemaName);
+
             string installNotificationTriggerScript =
                 string.Format(
                     SQL_FORMAT_CREATE_NOTIFICATION_TRIGGER,
+                    this.TableName,
+                    this.ConversationTriggerName,
+                    GetTriggerTypeByListenerType(),
+                    this.ConversationServiceName,
+                    this.DetailsIncluded ? string.Empty : @"NOT",
+                    this.SchemaName);
+            string installNotificationTriggerWithFieldsScript =
+                string.Format(
+                    SQL_FORMAT_CREATE_NOTIFICATION_TRIGGER_WITH_FIELDS,
                     this.TableName,
                     this.ConversationTriggerName,
                     GetTriggerTypeByListenerType(),
@@ -733,15 +836,16 @@ namespace ServiceBrokerListener.Domain
                     this.ConversationTriggerName,
                     this.SchemaName);
             string installationProcedureScript =
-                string.Format(
-                    SQL_FORMAT_CREATE_INSTALLATION_PROCEDURE,
-                    this.DatabaseName,
-                    this.InstallListenerProcedureName,
-                    installServiceBrokerNotificationScript.Replace("'", "''"),
-                    installNotificationTriggerScript.Replace("'", "''''"),
-                    uninstallNotificationTriggerScript.Replace("'", "''"),
-                    this.TableName,
-                    this.SchemaName);
+                   string.Format(
+                       SQL_FORMAT_CREATE_INSTALLATION_PROCEDURE,
+                       this.DatabaseName,
+                       this.InstallListenerProcedureName,
+                       installServiceBrokerNotificationScript.Replace("'", "''"),
+                       this.FieldList == null ? installNotificationTriggerScript.Replace("'", "''''") : installNotificationTriggerWithFieldsScript.Replace("'", "''''"),
+                       uninstallNotificationTriggerScript.Replace("'", "''"),
+                       this.TableName,
+                       this.SchemaName,
+                       this.FieldList == null ? "" : string.Format(" AND COLUMN_NAME IN ({0})", string.Join(",", FieldList.ToArray())));
             return installationProcedureScript;
         }
 
